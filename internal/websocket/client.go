@@ -4,7 +4,7 @@ import (
 	"log"
 	"time"
 
-	"collabflow/internal/models"
+	"collabflow/internal/messaging"
 	"github.com/gorilla/websocket"
 )
 
@@ -30,27 +30,37 @@ type Client struct {
 	conn *websocket.Conn
 
 	// Buffered channel of outbound messages.
-	send chan models.Message
+	send chan messaging.Event
 
 	// Unique identifier for the client.
 	userID string
+
+	// Document ID room this client belongs to.
+	documentID string
 }
 
 // NewClient creates a new client instance.
-func NewClient(hub *Hub, conn *websocket.Conn, userID string) *Client {
+func NewClient(hub *Hub, conn *websocket.Conn, userID, documentID string) *Client {
 	return &Client{
-		hub:    hub,
-		conn:   conn,
-		send:   make(chan models.Message, 256),
-		userID: userID,
+		hub:        hub,
+		conn:       conn,
+		send:       make(chan messaging.Event, 256),
+		userID:     userID,
+		documentID: documentID,
 	}
 }
 
+// UserID returns the client's user ID.
+func (c *Client) UserID() string {
+	return c.userID
+}
+
+// DocumentID returns the client's document ID.
+func (c *Client) DocumentID() string {
+	return c.documentID
+}
+
 // ReadPump pumps messages from the websocket connection to the hub.
-//
-// The application runs ReadPump in a per-connection goroutine. The application
-// ensures that there is at most one reader on a connection by executing all
-// reads from this goroutine.
 func (c *Client) ReadPump() {
 	defer func() {
 		c.hub.unregister <- c
@@ -63,7 +73,7 @@ func (c *Client) ReadPump() {
 		return nil
 	})
 	for {
-		var msg models.Message
+		var msg messaging.Event
 		err := c.conn.ReadJSON(&msg)
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
@@ -71,20 +81,24 @@ func (c *Client) ReadPump() {
 			}
 			break
 		}
-		// If UserID is empty, populate it from client registration
+
+		// Fill missing fields with client metadata
 		if msg.UserID == "" {
 			msg.UserID = c.userID
 		}
-		// Send the message to the hub to be broadcasted
-		c.hub.broadcast <- msg
+		if msg.DocumentID == "" {
+			msg.DocumentID = c.documentID
+		}
+		if msg.ServerID == "" {
+			msg.ServerID = c.hub.ServerID()
+		}
+
+		// Pass message to hub to publish via Redis
+		c.hub.inbound <- msg
 	}
 }
 
 // WritePump pumps messages from the hub to the websocket connection.
-//
-// A goroutine running WritePump is started for each connection. The
-// application ensures that there is at most one writer to a connection by
-// executing all writes from this goroutine.
 func (c *Client) WritePump() {
 	ticker := time.NewTicker(pingPeriod)
 	defer func() {

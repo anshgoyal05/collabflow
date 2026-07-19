@@ -1,47 +1,72 @@
-# CollabFlow Architecture — Week 1 Day 1
+# CollabFlow Architecture — Week 2 Distributed WebSocket Layer
 
-This document outlines the software architecture for the foundational real-time collaboration engine implemented in Week 1.
+This document describes the distributed architecture for CollabFlow's horizontally scalable real-time collaboration engine using Redis Pub/Sub.
 
-## System Components
+---
+
+## Distributed System Architecture
 
 ```mermaid
-graph TD
-    Client1[Client A] <-->|WebSocket| Server[Go HTTP Server]
-    Client2[Client B] <-->|WebSocket| Server
-    Server -->|Upgrade Conn| ConnHandler[ServeWs Handler]
-    ConnHandler -->|Create| ClientStructA[Client Struct A]
-    ConnHandler -->|Create| ClientStructB[Client Struct B]
-    ClientStructA -->|Register| Hub[Hub Engine]
-    ClientStructB -->|Register| Hub
-    ClientStructA -.->|Send Message| Hub
-    Hub -.->|Broadcast Message| ClientStructB
-    Hub -.->|Broadcast Message| ClientStructA
+flowchart LR
+
+A[User A]
+B[User B]
+
+S1[WebSocket Server 1\n:8081]
+S2[WebSocket Server 2\n:8082]
+
+R[(Redis Pub/Sub\n:6379)]
+
+A -->|ws://localhost:8081/doc_123| S1
+B -->|ws://localhost:8082/doc_123| S2
+
+S1 -->|Publish document:doc_123| R
+R -->|PSubscribe document:*| S2
+R -->|PSubscribe document:*| S1
 ```
 
-### 1. Main Entrypoint (`cmd/websocket-server/main.go`)
-- Sets up environment configuration (e.g. `PORT`).
-- Instantiates and starts the main synchronization engine (`Hub`).
-- Registers the `/ws` HTTP endpoint.
+---
 
-### 2. Hub (`internal/websocket/hub.go`)
-- Maintains thread-safe registration of connected clients using standard synchronization primitives (`sync.RWMutex`).
-- Coordinates message distribution. When a client publishes a message, it is received on the `broadcast` channel and dispatched to the write buffers of all registered clients.
-- Coordinates graceful connection termination and removal of inactive clients.
+## Sequence Flow: Distributed Edit Broadcast
 
-### 3. Client (`internal/websocket/client.go`)
-- Represents a single connection session.
-- Runs two continuous pumps per connection:
-  - **`ReadPump`**: Listens for incoming WebSocket frames from the user, parses JSON into `models.Message` schema, and forwards them to the hub's `broadcast` channel.
-  - **`WritePump`**: Consumes messages from the client's internal buffered channel and writes them down the socket to the client. Includes periodic heartbeat `Ping` frames to keep the connection alive and detect zombie clients.
+```mermaid
+sequenceDiagram
+    autonumber
+    actor UserA as User A (Server 1)
+    participant S1 as WebSocket Server 1
+    participant Redis as Redis Pub/Sub
+    participant S2 as WebSocket Server 2
+    actor UserB as User B (Server 2)
 
-### 4. Message Schema (`internal/models/message.go`)
-- Employs a payload structure optimized for future conflict-free replicated data type (CRDT) operations:
-  ```json
-  {
-    "type": "insert",
-    "userId": "userA",
-    "documentId": "doc123",
-    "content": "Hello",
-    "payload": null
-  }
-  ```
+    UserA->>S1: WebSocket message {"type":"insert", "documentId":"doc_123", "value":"Hello"}
+    S1->>S1: Validate & stamp ServerID ("SERVER-1")
+    S1->>Redis: PUBLISH document:doc_123 payload
+    Redis-->>S1: Redis Pub/Sub Event (document:doc_123)
+    Redis-->>S2: Redis Pub/Sub Event (document:doc_123)
+    S1->>UserA: Broadcast to local clients in doc_123
+    S2->>UserB: Broadcast to local clients in doc_123
+```
+
+---
+
+## Core System Components
+
+### 1. Configuration & Environments (`internal/config`)
+- Loads `PORT`, `REDIS_ADDR`, and `SERVER_ID` dynamically from environment variables.
+- Defaults to local development parameters when unconfigured.
+
+### 2. Messaging & Event Protocol (`internal/messaging`)
+- Defines standard payload structure (`Event`) supporting edit type (`insert`, `delete`), `documentId`, `userId`, `position`, `content`, `value`, `serverId`, and `payload` for future CRDT integrations.
+
+### 3. Redis Publisher & Subscriber (`internal/redis`)
+- **Publisher**: Serializes edits and publishes to Redis channel `document:<documentID>`.
+- **Subscriber**: Subscribes to pattern `document:*`. Listens asynchronously for events across all active document channels and forwards them to the WebSocket engine.
+
+### 4. Stateless WebSocket Hub (`internal/websocket`)
+- Does **not** maintain document state or global user presence in server memory.
+- Manages local client connections partitioned into document-based rooms (`rooms map[string]map[*Client]bool`).
+- Forwards local user actions to Redis Pub/Sub and dispatches incoming Redis events to connected local clients in the specified room.
+
+### 5. Executables (`cmd/`)
+- **`cmd/websocket-server/main.go`**: Distributed WebSocket node server listening for client connections.
+- **`cmd/redis-worker/main.go`**: Background worker process monitoring and logging Redis Pub/Sub document stream activity.

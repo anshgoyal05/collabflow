@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"log"
 	"net/http"
+	"strings"
 
 	"github.com/gorilla/websocket"
 )
@@ -14,7 +15,6 @@ var upgrader = websocket.Upgrader{
 	WriteBufferSize: 1024,
 	CheckOrigin: func(r *http.Request) bool {
 		// Allow all connections for development.
-		// In production, configure to allow specific domains.
 		return true
 	},
 }
@@ -41,11 +41,25 @@ func ServeWs(hub *Hub, w http.ResponseWriter, r *http.Request) {
 		userID = GenerateRandomID()
 	}
 
-	client := NewClient(hub, conn, userID)
+	documentID := r.URL.Query().Get("documentId")
+	if documentID == "" {
+		path := strings.TrimPrefix(r.URL.Path, "/")
+		if strings.HasPrefix(path, "ws/") {
+			path = strings.TrimPrefix(path, "ws/")
+		} else if path == "ws" {
+			path = ""
+		}
+		if path != "" {
+			documentID = path
+		}
+	}
+	if documentID == "" {
+		documentID = "default"
+	}
+
+	client := NewClient(hub, conn, userID, documentID)
 	hub.register <- client
 
-	// Allow collection of memory referenced by the caller by doing all work in
-	// new goroutines.
 	go client.WritePump()
 	go client.ReadPump()
 }
