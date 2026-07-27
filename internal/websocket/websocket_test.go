@@ -134,7 +134,7 @@ func TestMultiServerRedisBroadcast(t *testing.T) {
 		Type:       "insert",
 		DocumentID: "doc_cross",
 		UserID:     "user_A",
-		Position:   5,
+		Position:   &messaging.Position{Index: 5},
 		Content:    "Hello from Server 1",
 	}
 

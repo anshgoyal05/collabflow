@@ -4,15 +4,24 @@ import (
 	"context"
 	"log"
 	"sync"
+	"time"
 
+	"collabflow/internal/cursor"
 	"collabflow/internal/messaging"
+	"collabflow/internal/presence"
 	"collabflow/internal/redis"
+	"collabflow/internal/typing"
 )
 
 // Hub maintains the set of active clients per document room and forwards messages to Redis.
 type Hub struct {
 	serverID  string
 	publisher *redis.Publisher
+
+	presenceMgr      *presence.Manager
+	heartbeatHandler *presence.HeartbeatHandler
+	cursorTracker    *cursor.Tracker
+	typingIndicator  *typing.Indicator
 
 	// Registered clients across all rooms.
 	clients map[*Client]bool
@@ -49,6 +58,19 @@ func NewHub(serverID string, publisher *redis.Publisher) *Hub {
 	}
 }
 
+// SetPresenceServices configures the presence, heartbeat, cursor, and typing services for Hub.
+func (h *Hub) SetPresenceServices(
+	presenceMgr *presence.Manager,
+	heartbeatHandler *presence.HeartbeatHandler,
+	cursorTracker *cursor.Tracker,
+	typingIndicator *typing.Indicator,
+) {
+	h.presenceMgr = presenceMgr
+	h.heartbeatHandler = heartbeatHandler
+	h.cursorTracker = cursorTracker
+	h.typingIndicator = typingIndicator
+}
+
 // ServerID returns the unique identifier for this server instance.
 func (h *Hub) ServerID() string {
 	return h.serverID
@@ -78,6 +100,28 @@ func (h *Hub) Run(ctx context.Context) {
 			h.mu.Unlock()
 			log.Printf("[%s]\nUser connected:\nuser_id=%s\ndocument=%s", h.serverID, client.userID, client.documentID)
 
+			if h.presenceMgr != nil {
+				go func(c *Client) {
+					onlineUsers, err := h.presenceMgr.RegisterUser(ctx, c.documentID, c.userID, h.serverID)
+					if err != nil {
+						log.Printf("[%s] Error registering presence for user %s: %v", h.serverID, c.userID, err)
+					}
+					// Send initial presence_update directly to newly connected client
+					initEvt := messaging.Event{
+						Type:        messaging.EventTypePresenceUpdate,
+						DocumentID:  c.documentID,
+						UserID:      c.userID,
+						OnlineUsers: onlineUsers,
+						ServerID:    h.serverID,
+						Timestamp:   time.Now().Unix(),
+					}
+					select {
+					case c.send <- initEvt:
+					default:
+					}
+				}(client)
+			}
+
 		case client := <-h.unregister:
 			h.mu.Lock()
 			if _, ok := h.clients[client]; ok {
@@ -90,6 +134,14 @@ func (h *Hub) Run(ctx context.Context) {
 				}
 				close(client.send)
 				log.Printf("[%s]\nUser disconnected:\nuser_id=%s\ndocument=%s", h.serverID, client.userID, client.documentID)
+
+				if h.presenceMgr != nil {
+					go func(docID, userID string) {
+						if err := h.presenceMgr.UnregisterUser(ctx, docID, userID, h.serverID); err != nil {
+							log.Printf("[%s] Error unregistering presence for user %s: %v", h.serverID, userID, err)
+						}
+					}(client.documentID, client.userID)
+				}
 			}
 			h.mu.Unlock()
 
@@ -97,22 +149,77 @@ func (h *Hub) Run(ctx context.Context) {
 			if msg.ServerID == "" {
 				msg.ServerID = h.serverID
 			}
-			log.Printf("[%s]\nPublished:\ndocument=%s", h.serverID, msg.DocumentID)
 
-			if h.publisher != nil {
-				go func(m messaging.Event) {
-					if err := h.publisher.Publish(ctx, m.DocumentID, m); err != nil {
-						log.Printf("[%s] Failed to publish event to Redis: %v", h.serverID, err)
-					}
-				}(msg)
-			} else {
-				// Standalone fallback when Redis publisher is absent
-				h.broadcastLocal(msg.DocumentID, msg)
+			// Handle presence-specific event types
+			switch msg.Type {
+			case messaging.EventTypeJoinDocument:
+				if h.presenceMgr != nil {
+					go func(m messaging.Event) {
+						onlineUsers, _ := h.presenceMgr.RegisterUser(ctx, m.DocumentID, m.UserID, h.serverID)
+						resp := messaging.Event{
+							Type:        messaging.EventTypePresenceUpdate,
+							DocumentID:  m.DocumentID,
+							OnlineUsers: onlineUsers,
+							ServerID:    h.serverID,
+							Timestamp:   time.Now().Unix(),
+						}
+						if h.publisher != nil {
+							_ = h.publisher.Publish(ctx, m.DocumentID, resp)
+						} else {
+							h.broadcastLocal(m.DocumentID, resp)
+						}
+					}(msg)
+				}
+
+			case messaging.EventTypeHeartbeat:
+				if h.heartbeatHandler != nil {
+					go func(m messaging.Event) {
+						_ = h.heartbeatHandler.ProcessHeartbeat(ctx, m.DocumentID, m.UserID)
+					}(msg)
+				}
+
+			case messaging.EventTypeCursorMove, messaging.EventTypeCursorUpdate:
+				if h.cursorTracker != nil {
+					go func(m messaging.Event) {
+						_ = h.cursorTracker.UpdateCursor(ctx, m.DocumentID, m.UserID, h.serverID, m.Position)
+					}(msg)
+				} else {
+					h.publishOrBroadcast(ctx, msg)
+				}
+
+			case messaging.EventTypeTyping, messaging.EventTypeTypingStart:
+				if h.typingIndicator != nil {
+					go func(m messaging.Event) {
+						status := true
+						if m.Status != nil {
+							status = *m.Status
+						}
+						_ = h.typingIndicator.SetTyping(ctx, m.DocumentID, m.UserID, h.serverID, status)
+					}(msg)
+				} else {
+					h.publishOrBroadcast(ctx, msg)
+				}
+
+			default:
+				h.publishOrBroadcast(ctx, msg)
 			}
 
 		case msg := <-h.redisEvent:
 			h.broadcastLocal(msg.DocumentID, msg)
 		}
+	}
+}
+
+func (h *Hub) publishOrBroadcast(ctx context.Context, msg messaging.Event) {
+	log.Printf("[%s]\nPublished:\ndocument=%s", h.serverID, msg.DocumentID)
+	if h.publisher != nil {
+		go func(m messaging.Event) {
+			if err := h.publisher.Publish(ctx, m.DocumentID, m); err != nil {
+				log.Printf("[%s] Failed to publish event to Redis: %v", h.serverID, err)
+			}
+		}(msg)
+	} else {
+		h.broadcastLocal(msg.DocumentID, msg)
 	}
 }
 
@@ -149,3 +256,4 @@ func (h *Hub) GetClients() []*Client {
 	}
 	return list
 }
+

@@ -6,7 +6,10 @@ import (
 	"net/http"
 
 	"collabflow/internal/config"
+	"collabflow/internal/cursor"
+	"collabflow/internal/presence"
 	"collabflow/internal/redis"
+	"collabflow/internal/typing"
 	"collabflow/internal/websocket"
 )
 
@@ -21,6 +24,7 @@ func main() {
 
 	var publisher *redis.Publisher
 	var subscriber *redis.Subscriber
+	var presenceStore *redis.PresenceStore
 
 	rdb, err := redis.NewClient(cfg.RedisAddr)
 	if err != nil {
@@ -29,10 +33,19 @@ func main() {
 		defer rdb.Close()
 		publisher = redis.NewPublisher(rdb)
 		subscriber = redis.NewSubscriber(rdb, cfg.ServerID)
+		presenceStore = redis.NewPresenceStore(rdb)
 	}
+
+	// Initialize Presence & Collaboration Services
+	presenceMgr := presence.NewManager(presenceStore, publisher)
+	heartbeatHandler := presence.NewHeartbeatHandler(presenceStore)
+	cleanupWorker := presence.NewCleanupWorker(presenceStore, publisher)
+	cursorTracker := cursor.NewTracker(presenceStore, publisher)
+	typingIndicator := typing.NewIndicator(presenceStore, publisher)
 
 	// Create and start Hub
 	hub := websocket.NewHub(cfg.ServerID, publisher)
+	hub.SetPresenceServices(presenceMgr, heartbeatHandler, cursorTracker, typingIndicator)
 
 	if subscriber != nil {
 		go func() {
@@ -43,6 +56,7 @@ func main() {
 	}
 
 	go hub.Run(ctx)
+	go cleanupWorker.Start(ctx)
 
 	// Handle WebSocket connections on all path routes (/ws, /ws/{docId}, /{docId})
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -55,3 +69,4 @@ func main() {
 		log.Fatalf("[%s] ListenAndServe failed: %v", cfg.ServerID, err)
 	}
 }
+
