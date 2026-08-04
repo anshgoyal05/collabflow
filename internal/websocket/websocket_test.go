@@ -10,6 +10,7 @@ import (
 
 	"collabflow/internal/messaging"
 	"collabflow/internal/redis"
+	"github.com/alicebob/miniredis/v2"
 	"github.com/gorilla/websocket"
 )
 
@@ -76,20 +77,32 @@ func TestWebSocketBroadcastLocal(t *testing.T) {
 }
 
 func TestMultiServerRedisBroadcast(t *testing.T) {
-	rdb, err := redis.NewClient("localhost:6379")
+	mr, err := miniredis.Run()
 	if err != nil {
-		t.Skipf("Skipping multi-server Redis integration test (Redis not available at localhost:6379): %v", err)
+		t.Fatalf("Failed to start miniredis: %v", err)
 	}
-	defer rdb.Close()
+	defer mr.Close()
+
+	rdb1, err := redis.NewClient(mr.Addr())
+	if err != nil {
+		t.Fatalf("Failed to connect rdb1: %v", err)
+	}
+	defer rdb1.Close()
+
+	rdb2, err := redis.NewClient(mr.Addr())
+	if err != nil {
+		t.Fatalf("Failed to connect rdb2: %v", err)
+	}
+	defer rdb2.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	pub1 := redis.NewPublisher(rdb)
-	pub2 := redis.NewPublisher(rdb)
+	pub1 := redis.NewPublisher(rdb1)
+	pub2 := redis.NewPublisher(rdb2)
 
-	sub1 := redis.NewSubscriber(rdb, "SERVER-1")
-	sub2 := redis.NewSubscriber(rdb, "SERVER-2")
+	sub1 := redis.NewSubscriber(rdb1, "SERVER-1")
+	sub2 := redis.NewSubscriber(rdb2, "SERVER-2")
 
 	hub1 := NewHub("SERVER-1", pub1)
 	hub2 := NewHub("SERVER-2", pub2)
@@ -100,7 +113,7 @@ func TestMultiServerRedisBroadcast(t *testing.T) {
 	go func() { _ = sub1.StartListening(ctx, hub1.HandleRedisEvent) }()
 	go func() { _ = sub2.StartListening(ctx, hub2.HandleRedisEvent) }()
 
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
 
 	httpServer1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ServeWs(hub1, w, r)

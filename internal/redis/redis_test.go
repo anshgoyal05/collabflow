@@ -6,13 +6,19 @@ import (
 	"time"
 
 	"collabflow/internal/messaging"
+	"github.com/alicebob/miniredis/v2"
 )
 
 func TestPublisherSubscriberIntegration(t *testing.T) {
-	// Attempt to connect to local Redis instance (e.g. docker or local redis)
-	client, err := NewClient("localhost:6379")
+	mr, err := miniredis.Run()
 	if err != nil {
-		t.Skipf("Skipping live Redis test (Redis not available at localhost:6379): %v", err)
+		t.Fatalf("Failed to start miniredis: %v", err)
+	}
+	defer mr.Close()
+
+	client, err := NewClient(mr.Addr())
+	if err != nil {
+		t.Fatalf("Failed to connect to miniredis: %v", err)
 	}
 	defer client.Close()
 
@@ -33,7 +39,7 @@ func TestPublisherSubscriberIntegration(t *testing.T) {
 	}()
 
 	// Give subscriber time to establish PSubscribe connection
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
 
 	testEvent := messaging.Event{
 		Type:       "insert",

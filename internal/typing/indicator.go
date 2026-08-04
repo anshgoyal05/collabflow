@@ -28,9 +28,15 @@ func NewIndicator(store *redis.PresenceStore, publisher *redis.Publisher) *Indic
 
 // SetTyping updates Redis typing status with 3s TTL and broadcasts a user_typing event.
 func (i *Indicator) SetTyping(ctx context.Context, docID, userID, serverID string, status bool) error {
-	if i.store != nil && status {
-		if err := i.store.SetTyping(ctx, docID, userID, i.ttl); err != nil {
-			log.Printf("[TYPING] Error setting typing key for user %s in doc %s: %v", userID, docID, err)
+	if i.store != nil {
+		if status {
+			if err := i.store.SetTyping(ctx, docID, userID, i.ttl); err != nil {
+				log.Printf("[TYPING] Error setting typing key for user %s in doc %s: %v", userID, docID, err)
+			}
+		} else {
+			if err := i.store.RemoveTyping(ctx, docID, userID); err != nil {
+				log.Printf("[TYPING] Error removing typing key for user %s in doc %s: %v", userID, docID, err)
+			}
 		}
 	}
 

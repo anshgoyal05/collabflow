@@ -15,21 +15,32 @@ import (
 	"collabflow/internal/typing"
 	"collabflow/internal/websocket"
 
+	"github.com/alicebob/miniredis/v2"
 	gorilla "github.com/gorilla/websocket"
 )
 
-func TestPresenceRegistrationAndHeartbeat(t *testing.T) {
-	rdb, err := redis.NewClient("localhost:6379")
+func setupMiniredis(t *testing.T) (*miniredis.Miniredis, *redis.PresenceStore, *redis.Publisher) {
+	mr, err := miniredis.Run()
 	if err != nil {
-		t.Skipf("Skipping live Redis presence test (Redis not available at localhost:6379): %v", err)
+		t.Fatalf("Failed to start miniredis: %v", err)
 	}
-	defer rdb.Close()
+	rdb, err := redis.NewClient(mr.Addr())
+	if err != nil {
+		mr.Close()
+		t.Fatalf("Failed to connect to miniredis: %v", err)
+	}
+	t.Cleanup(func() {
+		rdb.Close()
+		mr.Close()
+	})
+	return mr, redis.NewPresenceStore(rdb), redis.NewPublisher(rdb)
+}
 
+func TestPresenceRegistrationAndHeartbeat(t *testing.T) {
+	_, store, pub := setupMiniredis(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	store := redis.NewPresenceStore(rdb)
-	pub := redis.NewPublisher(rdb)
 	mgr := presence.NewManager(store, pub)
 	hb := presence.NewHeartbeatHandler(store)
 
@@ -69,17 +80,10 @@ func TestPresenceRegistrationAndHeartbeat(t *testing.T) {
 }
 
 func TestOfflineUserDetection(t *testing.T) {
-	rdb, err := redis.NewClient("localhost:6379")
-	if err != nil {
-		t.Skipf("Skipping live Redis offline cleanup test (Redis not available at localhost:6379): %v", err)
-	}
-	defer rdb.Close()
-
+	_, store, pub := setupMiniredis(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	store := redis.NewPresenceStore(rdb)
-	pub := redis.NewPublisher(rdb)
 	worker := presence.NewCleanupWorker(store, pub)
 
 	docID := "test_offline_doc"
@@ -111,17 +115,10 @@ func TestOfflineUserDetection(t *testing.T) {
 }
 
 func TestCursorAndTypingIndicators(t *testing.T) {
-	rdb, err := redis.NewClient("localhost:6379")
-	if err != nil {
-		t.Skipf("Skipping live Redis cursor/typing test (Redis not available at localhost:6379): %v", err)
-	}
-	defer rdb.Close()
-
+	_, store, pub := setupMiniredis(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	store := redis.NewPresenceStore(rdb)
-	pub := redis.NewPublisher(rdb)
 	curTracker := cursor.NewTracker(store, pub)
 	typIndicator := typing.NewIndicator(store, pub)
 
@@ -142,9 +139,9 @@ func TestCursorAndTypingIndicators(t *testing.T) {
 		t.Errorf("Expected cursor position for %s, got empty", userID)
 	}
 
-	// 2. Typing indicator (3s TTL)
+	// 2. Typing indicator (start typing)
 	if err := typIndicator.SetTyping(ctx, docID, userID, "TEST-SERVER", true); err != nil {
-		t.Fatalf("Failed to set typing: %v", err)
+		t.Fatalf("Failed to set typing true: %v", err)
 	}
 
 	isTyping, err := typIndicator.IsTyping(ctx, docID, userID)
@@ -155,28 +152,53 @@ func TestCursorAndTypingIndicators(t *testing.T) {
 		t.Errorf("Expected user %s to be typing", userID)
 	}
 
+	// 3. Typing indicator (stop typing)
+	if err := typIndicator.SetTyping(ctx, docID, userID, "TEST-SERVER", false); err != nil {
+		t.Fatalf("Failed to set typing false: %v", err)
+	}
+
+	isTyping, err = typIndicator.IsTyping(ctx, docID, userID)
+	if err != nil {
+		t.Fatalf("Failed to check typing state: %v", err)
+	}
+	if isTyping {
+		t.Errorf("Expected user %s to stop typing, but typing key was found", userID)
+	}
+
 	// Clean up
 	_ = store.RemoveUser(ctx, docID, userID)
 }
 
 func TestMultiServerPresenceBroadcast(t *testing.T) {
-	rdb, err := redis.NewClient("localhost:6379")
+	mr, err := miniredis.Run()
 	if err != nil {
-		t.Skipf("Skipping live Multi-Server Presence test (Redis not available at localhost:6379): %v", err)
+		t.Fatalf("Failed to start miniredis: %v", err)
 	}
-	defer rdb.Close()
+	defer mr.Close()
+
+	rdb1, err := redis.NewClient(mr.Addr())
+	if err != nil {
+		t.Fatalf("Failed to connect rdb1: %v", err)
+	}
+	defer rdb1.Close()
+
+	rdb2, err := redis.NewClient(mr.Addr())
+	if err != nil {
+		t.Fatalf("Failed to connect rdb2: %v", err)
+	}
+	defer rdb2.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	store1 := redis.NewPresenceStore(rdb)
-	store2 := redis.NewPresenceStore(rdb)
+	store1 := redis.NewPresenceStore(rdb1)
+	store2 := redis.NewPresenceStore(rdb2)
 
-	pub1 := redis.NewPublisher(rdb)
-	pub2 := redis.NewPublisher(rdb)
+	pub1 := redis.NewPublisher(rdb1)
+	pub2 := redis.NewPublisher(rdb2)
 
-	sub1 := redis.NewSubscriber(rdb, "SERVER-1")
-	sub2 := redis.NewSubscriber(rdb, "SERVER-2")
+	sub1 := redis.NewSubscriber(rdb1, "SERVER-1")
+	sub2 := redis.NewSubscriber(rdb2, "SERVER-2")
 
 	hub1 := websocket.NewHub("SERVER-1", pub1)
 	hub2 := websocket.NewHub("SERVER-2", pub2)
@@ -201,7 +223,7 @@ func TestMultiServerPresenceBroadcast(t *testing.T) {
 	go func() { _ = sub1.StartListening(ctx, hub1.HandleRedisEvent) }()
 	go func() { _ = sub2.StartListening(ctx, hub2.HandleRedisEvent) }()
 
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
 
 	httpServer1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		websocket.ServeWs(hub1, w, r)
@@ -229,7 +251,7 @@ func TestMultiServerPresenceBroadcast(t *testing.T) {
 	}
 	defer conn2.Close()
 
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(150 * time.Millisecond)
 
 	// User A on Server 1 sends a cursor move
 	cursorEvt := messaging.Event{

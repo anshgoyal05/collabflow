@@ -59,14 +59,16 @@ func (p *PresenceStore) GetOnlineUsers(ctx context.Context, docID string, minSco
 	return users, nil
 }
 
-// RemoveUser removes a user from presence sorted set and cursor hash.
+// RemoveUser removes a user from presence sorted set, cursor hash, and typing key.
 func (p *PresenceStore) RemoveUser(ctx context.Context, docID, userID string) error {
 	presKey := GetPresenceKey(docID)
 	curKey := GetCursorKey(docID)
+	typKey := GetTypingKey(docID, userID)
 
 	pipe := p.rdb.Pipeline()
 	pipe.ZRem(ctx, presKey, userID)
 	pipe.HDel(ctx, curKey, userID)
+	pipe.Del(ctx, typKey)
 	_, err := pipe.Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to remove user %s from %s: %w", userID, docID, err)
@@ -94,7 +96,7 @@ func (p *PresenceStore) GetActiveDocumentIDs(ctx context.Context) ([]string, err
 	return docIDs, nil
 }
 
-// CleanupOfflineUsers removes users whose last seen timestamp is < cutoffTimestamp from presence and cursor store.
+// CleanupOfflineUsers removes users whose last seen timestamp is < cutoffTimestamp from presence, cursor, and typing store.
 // Returns the list of evicted user IDs.
 func (p *PresenceStore) CleanupOfflineUsers(ctx context.Context, docID string, cutoffTimestamp int64) ([]string, error) {
 	key := GetPresenceKey(docID)
@@ -113,6 +115,7 @@ func (p *PresenceStore) CleanupOfflineUsers(ctx context.Context, docID string, c
 	pipe.ZRemRangeByScore(ctx, key, "-inf", fmt.Sprintf("(%d", cutoffTimestamp))
 	for _, user := range expiredUsers {
 		pipe.HDel(ctx, curKey, user)
+		pipe.Del(ctx, GetTypingKey(docID, user))
 	}
 	_, err = pipe.Exec(ctx)
 	if err != nil {
@@ -146,6 +149,15 @@ func (p *PresenceStore) SetTyping(ctx context.Context, docID, userID string, ttl
 	key := GetTypingKey(docID, userID)
 	if err := p.rdb.Set(ctx, key, "1", ttl).Err(); err != nil {
 		return fmt.Errorf("failed to set typing state for user %s in %s: %w", userID, docID, err)
+	}
+	return nil
+}
+
+// RemoveTyping deletes typing status key for a user in a document.
+func (p *PresenceStore) RemoveTyping(ctx context.Context, docID, userID string) error {
+	key := GetTypingKey(docID, userID)
+	if err := p.rdb.Del(ctx, key).Err(); err != nil {
+		return fmt.Errorf("failed to remove typing state for user %s in %s: %w", userID, docID, err)
 	}
 	return nil
 }
